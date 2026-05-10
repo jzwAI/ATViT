@@ -1,6 +1,11 @@
 # Generalization-Analysis-for-Adversarial-Vision-Transformers
 "Code and appendix for the IJCAI 2026 paper: Generalization Analysis for Adversarial Vision Transformers."
 
-1.Environment Setup
-# Install all dependencies
+## 🚀 Quick Start
+
+### 1. Environment Setting 
+
+```bash
+git clone https://github.com/jzwAI/ATViT.git
+cd ATViT
 pip install -r requirements.txt
