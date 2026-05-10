@@ -9,7 +9,7 @@
 git clone https://github.com/jzwAI/ATViT.git
 cd ATViT
 pip install -r requirements.txt
-
+```
 ### 2. Pretrain
 
 ```bash
