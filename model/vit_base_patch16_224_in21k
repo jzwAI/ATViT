@@ -1,0 +1,23 @@
+The backbone model used in this work is **vit_base_patch16_224_in21k**, 
+which is pre-trained on ImageNet-21k. Due to file size limitations, 
+this model is **not included** in this repository.
+
+**Download Instructions:**
+
+1. Visit the official model page:  
+   [https://huggingface.co/google/vit-base-patch16-224-in21k](https://huggingface.co/google/vit-base-patch16-224-in21k)  
+   (or the corresponding PyTorch / timm model hub)
+
+2. Download the pre-trained weights file (e.g., `pytorch_model.bin`).
+
+3. Place the downloaded file into the `model/` directory:
+
+The pre-trained model was fine-tuned and evaluated on the following 
+four benchmark datasets:
+
+| Dataset | Resolution | Description |
+|:--------|:-----------|:------------|
+| Oxford-IIIT Pets | 384 × 384 | Pet breed classification (37 categories) |
+| Flowers-102 | 384 × 384 | Flower species classification (102 categories) |
+| CIFAR-10 | 224 × 224 | General object classification (10 categories) |
+| CIFAR-100 | 224 × 224 | Fine-grained object classification (100 categories) |
