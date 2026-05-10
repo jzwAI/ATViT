@@ -1,0 +1,464 @@
+import json
+import numpy as np
+import timm
+import torch.optim as optim
+from matplotlib import pyplot as plt
+from torch import nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms, datasets
+import logging
+from tqdm import tqdm
+import time
+import os
+import torch
+import torch.nn.functional as F
+
+logging.getLogger("torch").setLevel(logging.ERROR)
+
+# ==================== Configuration ====================
+# Modify this configuration to switch between different datasets and models
+
+CONFIG = {
+    # Dataset selection: "cifar10", "cifar100", "pets", "flower"
+    "dataset": "cifar10",
+
+    # Model configuration
+    "model_name": "vit_base_patch16_224.augreg_in21k",
+    "img_size": 384,
+    "pretrained_path": "vit_b16_cifar10_imagesize384.pth",  # Modify according to dataset
+
+    # Training configuration
+    "batch_size": 32,
+    "epochs": 20,
+    "lr": 1e-5,
+
+    # Regularization configuration
+    "reg_type": "all_layers",  # "none", "first_layer", "all_layers"
+    "base_k": 1.0,
+
+    # PGD attack configuration
+    "epsilon": 4 / 255,
+    "alpha": 1 / 255,
+    "steps": 5,
+
+    # Dataset size configuration
+    "train_size": 5000,
+    "test_size": 1000,
+}
+
+# ==================== Dataset Configuration ====================
+
+DATASET_CONFIG = {
+    "cifar10": {
+        "num_classes": 10,
+        "model_path": "vit_b16_cifar10_imagesize384.pth",
+        "mean": [0.4914, 0.4822, 0.4465],
+        "std": [0.2470, 0.2435, 0.2616],
+    },
+    "cifar100": {
+        "num_classes": 100,
+        "model_path": "vit_b16_cifar100_imagesize384.pth",
+        "mean": [0.5071, 0.4867, 0.4408],
+        "std": [0.2675, 0.2565, 0.2761],
+    },
+    "pets": {
+        "num_classes": 37,
+        "model_path": "vit_b16_pets_imagesize384.pth",
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+    },
+    "flower": {
+        "num_classes": 102,
+        "model_path": "vit_b16_flowers102_imagesize384.pth",
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+    },
+}
+
+# ==================== Device Configuration ====================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def get_dataset(dataset_name, img_size, train_size, test_size):
+    """Get dataset"""
+    config = DATASET_CONFIG[dataset_name]
+
+    transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=config["mean"], std=config["std"]),
+    ])
+
+    if dataset_name == "cifar10":
+        train_dataset = datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
+        val_dataset = datasets.CIFAR10(root="./data", train=False, transform=transform, download=True)
+    elif dataset_name == "cifar100":
+        train_dataset = datasets.CIFAR100(root="./data", train=True, transform=transform, download=True)
+        val_dataset = datasets.CIFAR100(root="./data", train=False, transform=transform, download=True)
+    elif dataset_name == "pets":
+        train_dataset = datasets.OxfordIIITPet(root="./data", split="trainval", transform=transform, download=True)
+        val_dataset = datasets.OxfordIIITPet(root="./data", split="test", transform=transform, download=True)
+    elif dataset_name == "flower":
+        train_dataset = datasets.Flowers102(root="./data", split="train", transform=transform, download=True)
+        val_dataset = datasets.Flowers102(root="./data", split="test", transform=transform, download=True)
+
+    # Create subsets
+    train_indices = np.random.choice(len(train_dataset), min(train_size, len(train_dataset)), replace=False)
+    test_indices = np.random.choice(len(val_dataset), min(test_size, len(val_dataset)), replace=False)
+
+    train_dataset = Subset(train_dataset, train_indices)
+    val_dataset = Subset(val_dataset, test_indices)
+
+    print(f"Dataset: {dataset_name}")
+    print(f"Training set size: {len(train_dataset)}, Test set size: {len(val_dataset)}")
+
+    return train_dataset, val_dataset, config
+
+
+def load_finetuned_model(model_path, num_classes, img_size):
+    """Load fine-tuned ViT model"""
+    model = timm.create_model(
+        "vit_base_patch16_224.augreg_in21k",
+        pretrained=False,
+        num_classes=num_classes,
+    )
+
+    if img_size != 224:
+        patch_size = model.patch_embed.patch_size[0]
+        orig_size = 224 // patch_size
+        new_size = img_size // patch_size
+
+        pos_embed = model.pos_embed
+        if pos_embed.shape[1] == orig_size ** 2 + 1:
+            cls_token = pos_embed[:, :1, :]
+            pos_embed = pos_embed[:, 1:, :]
+            pos_embed = pos_embed.reshape(1, orig_size, orig_size, -1).permute(0, 3, 1, 2)
+            pos_embed = nn.functional.interpolate(pos_embed, size=(new_size, new_size), mode='bilinear')
+            pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_size * new_size, -1)
+            pos_embed = torch.cat([cls_token, pos_embed], dim=1)
+        else:
+            pos_embed = pos_embed.reshape(1, orig_size, orig_size, -1).permute(0, 3, 1, 2)
+            pos_embed = nn.functional.interpolate(pos_embed, size=(new_size, new_size), mode='bilinear')
+            pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_size * new_size, -1)
+
+        model.pos_embed = nn.Parameter(pos_embed)
+        model.patch_embed.img_size = (img_size, img_size)
+        model.patch_embed.grid_size = (new_size, new_size)
+
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict)
+    return model
+
+
+def get_all_ffn_matrices(model):
+    """Get all feed-forward network weight matrices from Transformer layers"""
+    ffn_matrices = []
+    for name, module in model.named_modules():
+        if 'blocks.' in name and '.mlp' in name and isinstance(module, nn.Module):
+            parts = name.split('.')
+            if len(parts) >= 2 and parts[0] == 'blocks':
+                try:
+                    if hasattr(module, 'fc1') and hasattr(module, 'fc2'):
+                        layer_idx = int(parts[1])
+                        w1 = module.fc1.weight
+                        w2 = module.fc2.weight
+                        ffn_matrices.append((layer_idx, w1, w2))
+                except (ValueError, IndexError, AttributeError):
+                    continue
+
+    ffn_matrices.sort(key=lambda x: x[0])
+    return ffn_matrices
+
+
+def pgd_attack_batch(model, images, labels, epsilon, alpha, steps):
+    """Generate adversarial examples for a single batch"""
+    images = images.clone().detach().to(device)
+    labels = labels.to(device)
+
+    perturbed = images + torch.empty_like(images).uniform_(-epsilon, epsilon)
+    perturbed = torch.clamp(perturbed, 0, 1).detach()
+
+    original_training_mode = model.training
+    model.eval()
+
+    for _ in range(steps):
+        perturbed.requires_grad = True
+        model.zero_grad()
+
+        with autocast():
+            outputs = model(perturbed)
+            loss = F.cross_entropy(outputs, labels)
+
+        grad = torch.autograd.grad(loss, perturbed, retain_graph=False, create_graph=False)[0]
+
+        with torch.no_grad():
+            perturbed = perturbed + alpha * grad.sign()
+            eta = torch.clamp(perturbed - images, -epsilon, epsilon)
+            perturbed = torch.clamp(images + eta, 0, 1).detach()
+
+    model.train(original_training_mode)
+    return perturbed
+
+
+def adversarial_train_with_regularization(model, train_loader, val_loader, optimizer, epsilon, alpha, steps, epochs, base_k, reg_type):
+    """Online adversarial training function"""
+    model.train()
+    scaler = GradScaler()
+
+    epoch_losses = []
+    epoch_accs = []
+    weight_norms = []
+    all_ffn_matrices = get_all_ffn_matrices(model)
+    num_layers = len(all_ffn_matrices)
+
+    if reg_type == 'none':
+        print(f"Regularization scheme: No regularization")
+    elif reg_type == 'first_layer':
+        print(f"Regularization scheme: Only first layer L2 regularization, k={base_k}")
+    elif reg_type == 'all_layers':
+        print(f"Regularization scheme: All layers with layer-wise regularization, base_k={base_k}")
+        print(f"Layer coefficients: k_l = base_k / (layer_idx + 1)")
+
+    for epoch in range(epochs):
+        epoch_start_time = time.time()
+        total_loss = 0
+        total_correct = 0
+        total_samples = 0
+        current_epoch_weight_norms = [[] for _ in range(num_layers)]
+
+        print(f"\nEpoch {epoch + 1}/{epochs}")
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+
+            if epsilon > 0:
+                perturbed_images = pgd_attack_batch(model, images, labels, epsilon, alpha, steps)
+            else:
+                perturbed_images = images
+
+            optimizer.zero_grad()
+
+            with autocast():
+                outputs = model(perturbed_images)
+                loss = F.cross_entropy(outputs, labels)
+
+                all_ffn_matrices = get_all_ffn_matrices(model)
+                total_reg = 0.0
+
+                if reg_type == 'first_layer' and all_ffn_matrices:
+                    layer_idx, w1, w2 = all_ffn_matrices[0]
+                    w1_norm = torch.norm(w1, p=2)
+                    w2_norm = torch.norm(w2, p=2)
+                    current_epoch_weight_norms[layer_idx].append((w1_norm.item(), w2_norm.item()))
+                    total_reg = base_k * (w1_norm + w2_norm) / 2
+                elif reg_type == 'all_layers':
+                    for layer_idx, w1, w2 in all_ffn_matrices:
+                        w1_norm = torch.norm(w1, p=2)
+                        w2_norm = torch.norm(w2, p=2)
+                        current_epoch_weight_norms[layer_idx].append((w1_norm.item(), w2_norm.item()))
+                        layer_k = base_k / (layer_idx + 1)
+                        layer_reg = layer_k * (w1_norm + w2_norm) / 2
+                        total_reg += layer_reg
+
+                loss = loss + total_reg
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total_samples += labels.size(0)
+            total_correct += predicted.eq(labels).sum().item()
+
+        avg_loss = total_loss / len(train_loader)
+        avg_acc = total_correct / total_samples
+        epoch_losses.append(avg_loss)
+        epoch_accs.append(avg_acc)
+
+        # Record weight norms
+        epoch_weight_norms = []
+        for layer_norms in current_epoch_weight_norms:
+            if layer_norms:
+                avg_w1 = np.mean([n[0] for n in layer_norms])
+                avg_w2 = np.mean([n[1] for n in layer_norms])
+                epoch_weight_norms.append((avg_w1, avg_w2))
+            else:
+                epoch_weight_norms.append((0.0, 0.0))
+        weight_norms.append(epoch_weight_norms)
+
+        epoch_time = time.time() - epoch_start_time
+
+        # Validation
+        val_loss, val_acc = evaluate(model, val_loader, epsilon=0)
+        adv_val_loss, adv_val_acc = evaluate(model, val_loader, epsilon=epsilon, alpha=alpha, steps=steps)
+
+        print(f"Epoch {epoch + 1} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f} - "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} - "
+              f"Adv Val Acc: {adv_val_acc:.4f} - Time: {epoch_time:.1f}s")
+
+    return epoch_losses, epoch_accs, weight_norms
+
+
+def evaluate(model, dataloader, epsilon=0, alpha=0, steps=0):
+    """Evaluate model"""
+    model.eval()
+    total_loss = 0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+
+            if epsilon > 0:
+                images = pgd_attack_batch(model, images, labels, epsilon, alpha, steps)
+
+            with autocast():
+                outputs = model(images)
+                loss = F.cross_entropy(outputs, labels)
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total_samples += labels.size(0)
+            total_correct += predicted.eq(labels).sum().item()
+
+    avg_loss = total_loss / len(dataloader)
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc
+
+
+def plot_results(epoch_losses, epoch_accs, weight_norms, config, dataset_name):
+    """Plot result charts"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Loss curve
+    axes[0].plot(epoch_losses)
+    axes[0].set_title(f'{dataset_name} - Training Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+
+    # Accuracy curve
+    axes[1].plot(epoch_accs)
+    axes[1].set_title(f'{dataset_name} - Training Accuracy')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Accuracy')
+
+    # Weight norm curve (first layer only)
+    if weight_norms and weight_norms[0]:
+        w1_norms = [wn[0][0] for wn in weight_norms]
+        w2_norms = [wn[0][1] for wn in weight_norms]
+        axes[2].plot(w1_norms, label='W1')
+        axes[2].plot(w2_norms, label='W2')
+        axes[2].set_title(f'{dataset_name} - Layer 1 Weight Norms')
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('Norm')
+        axes[2].legend()
+
+    plt.tight_layout()
+    plt.savefig(f'{dataset_name}_training_results.png', dpi=150)
+    plt.close()
+
+
+def main():
+    dataset_name = CONFIG["dataset"]
+    img_size = CONFIG["img_size"]
+    batch_size = CONFIG["batch_size"]
+    epochs = CONFIG["epochs"]
+    lr = CONFIG["lr"]
+    epsilon = CONFIG["epsilon"]
+    alpha = CONFIG["alpha"]
+    steps = CONFIG["steps"]
+    base_k = CONFIG["base_k"]
+    reg_type = CONFIG["reg_type"]
+    train_size = CONFIG["train_size"]
+    test_size = CONFIG["test_size"]
+
+    print("=" * 60)
+    print(f"Dataset: {dataset_name}")
+    print(f"Regularization scheme: {reg_type}")
+    print(f"Epochs: {epochs}, Epsilon: {epsilon:.6f}")
+    print("=" * 60)
+
+    # Get dataset
+    train_dataset, val_dataset, dataset_config = get_dataset(
+        dataset_name, img_size, train_size, test_size
+    )
+
+    num_classes = dataset_config["num_classes"]
+    model_path = dataset_config["model_path"]
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # Load model
+    if not os.path.exists(model_path):
+        print(f"Error: Model file {model_path} does not exist!")
+        return
+
+    model = load_finetuned_model(model_path, num_classes, img_size).to(device)
+    print(f"Model loaded successfully: {model_path}")
+
+    # Get FFN matrix information
+    all_ffn_matrices = get_all_ffn_matrices(model)
+    num_layers = len(all_ffn_matrices)
+    print(f"Model has {num_layers} Transformer layers")
+
+    # Print layer-wise regularization coefficients
+    if reg_type == 'all_layers':
+        print("Layer-wise regularization coefficients:")
+        for layer_idx in range(num_layers):
+            k_l = base_k / (layer_idx + 1)
+            print(f"  Layer {layer_idx}: k = {base_k} / {layer_idx + 1} = {k_l:.4f}")
+
+    # Evaluate initial model
+    initial_val_loss, initial_val_acc = evaluate(model, val_loader, epsilon=0)
+    print(f"Initial model test accuracy: {initial_val_acc:.4f}")
+
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Adversarial training
+    print(f"\nStarting adversarial training (epsilon={epsilon:.6f}, steps={steps})...")
+    epoch_losses, epoch_accs, weight_norms = adversarial_train_with_regularization(
+        model, train_loader, val_loader, optimizer, epsilon, alpha, steps, epochs, base_k, reg_type
+    )
+
+    # Final evaluation
+    print("\n" + "=" * 60)
+    print("Final results:")
+    final_train_loss, final_train_acc = evaluate(model, train_loader, epsilon=0)
+    final_val_loss, final_val_acc = evaluate(model, val_loader, epsilon=0)
+    adv_val_loss, adv_val_acc = evaluate(model, val_loader, epsilon=epsilon, alpha=alpha, steps=steps)
+
+    print(f"Training accuracy: {final_train_acc:.4f}")
+    print(f"Clean test accuracy: {final_val_acc:.4f}")
+    print(f"Adversarial test accuracy: {adv_val_acc:.4f}")
+    print("=" * 60)
+    
+    plot_results(epoch_losses, epoch_accs, weight_norms, CONFIG, dataset_name)
+
+    # save results
+    results = {
+        "config": CONFIG,
+        "dataset": dataset_name,
+        "epoch_losses": epoch_losses,
+        "epoch_accs": epoch_accs,
+        "weight_norms": weight_norms,
+        "final_metrics": {
+            "train_acc": final_train_acc,
+            "val_acc": final_val_acc,
+            "adv_val_acc": adv_val_acc
+        }
+    }
+
+    result_file = f"results_{dataset_name}_{reg_type}.json"
+    with open(result_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+
+    print(f"\nResults saved to: {result_file}")
+
+
+if __name__ == "__main__":
+    main()
