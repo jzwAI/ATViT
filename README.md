@@ -11,5 +11,6 @@ cd ATViT
 pip install -r requirements.txt
 
 ### 2. Pretrain
+
 ```bash
 python pretrain.py
